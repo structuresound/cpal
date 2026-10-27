@@ -92,12 +92,47 @@ mod enumerate;
 const DEFAULT_DEVICE: &str = "default";
 const DEFAULT_PERIODS: alsa::pcm::Frames = 2;
 
+// Opt-in blocking-writei output feed: `CPAL_ALSA_BLOCKING_WRITE=1`.
+//
+// The default output worker waits in poll() for a whole free period, then
+// renders, then writes. The blocking feed renders a period and hands it to a
+// blocking `writei`, which is how `aplay` feeds a device: the kernel copies
+// whatever fits as soon as any space frees, so the ring stays full and the
+// render overlaps the drain instead of eating into it.
+//
+// Measured on a class-compliant USB dongle (snd-usb-audio, lowlatency=Y) on an
+// Allwinner H618, 48 kHz, 4 x 120 s per arm (noisetable R994-S11):
+// - period 32, ring 64: the default feed delivers ~1,700 of 48,000 frames/s
+//   while reporting RUNNING and no xruns; the blocking feed is clean at
+//   2.13-2.42 ms delay, idle and under Wi-Fi + PWM load.
+// - default feed at period 64: clean at 2.83-3.21 ms.
+// A poll()-driven top-up was tried first and is not equivalent: snd-usb-audio
+// can move its pointer after the poller sleeps without waking it, so poll()
+// either needs a timer (too coarse at ms granularity for a 1.33 ms ring) or
+// stalls.
+//
+// An env var because this branch measures it; an upstream version wants a
+// stream-config option instead.
+fn blocking_write_feed() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CPAL_ALSA_BLOCKING_WRITE").as_deref() == Ok("1"))
+}
+
 // Some ALSA plugins (e.g. alsaequal, certain USB drivers) are not reentrant.
 static ALSA_OPEN_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn open_pcm(pcm_id: &str, direction: alsa::Direction) -> Result<alsa::pcm::PCM, Error> {
+    open_pcm_mode(pcm_id, direction, true)
+}
+
+fn open_pcm_mode(
+    pcm_id: &str,
+    direction: alsa::Direction,
+    nonblock: bool,
+) -> Result<alsa::pcm::PCM, Error> {
     let _guard = ALSA_OPEN_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    alsa::pcm::PCM::new(pcm_id, direction, true).map_err(|e| {
+    alsa::pcm::PCM::new(pcm_id, direction, nonblock).map_err(|e| {
         let e = Error::from(e);
         if e.kind() == ErrorKind::UnsupportedConfig {
             let dir = match direction {
@@ -383,7 +418,17 @@ impl Device {
     ) -> Result<StreamInner, Error> {
         crate::validate_stream_config(&conf)?;
 
-        let handle = open_pcm(&self.pcm_id, stream_type)?;
+        let blocking_writes =
+            stream_type == alsa::Direction::Playback && blocking_write_feed();
+        let handle = if blocking_writes {
+            // Open nonblocking first so a busy device still fails fast, as on
+            // the default path, then reopen blocking. The alsa crate has no
+            // snd_pcm_nonblock(); with it this would be one open.
+            drop(open_pcm(&self.pcm_id, stream_type)?);
+            open_pcm_mode(&self.pcm_id, stream_type, false)?
+        } else {
+            open_pcm(&self.pcm_id, stream_type)?
+        };
 
         let hw_params = set_hw_params_from_format(&handle, conf, sample_format)?;
         let (buffer_size, period_size) = set_sw_params_from_format(&handle, stream_type)?;
@@ -414,6 +459,7 @@ impl Device {
 
         let stream_inner = StreamInner {
             dropping: AtomicBool::new(false),
+            blocking_writes,
             direction: stream_type.into(),
             handle,
             sample_format,
@@ -710,6 +756,10 @@ struct StreamInner {
     // (e.g. broken due to a disconnected device).
     dropping: AtomicBool,
 
+    // Output fed by a blocking writei on a blocking handle (see
+    // `blocking_write_feed`). Fixed at open.
+    blocking_writes: bool,
+
     // Stream direction.
     direction: DeviceDirection,
 
@@ -982,21 +1032,47 @@ fn output_stream_worker(
         if stream.dropping.load(Ordering::Acquire) {
             return;
         }
-        let result = match poll_for_period(&rx, stream, &mut ctxt) {
-            Ok(Poll::Pending) => continue,
-            Ok(Poll::Ready {
-                status,
-                delay_frames,
-            }) => process_output(
-                stream,
-                &mut ctxt.transfer_buffer,
-                status,
-                delay_frames,
-                data_callback,
-            ),
-            Err(err) => Err(err),
+        let result = if stream.blocking_writes {
+            // No poll(): render now, then process_output's writei blocks until
+            // the whole period is in. On a running PCM that is at most about
+            // a period, so the dropping flag above is still seen promptly.
+            match output_status(stream) {
+                Ok(Some((status, delay_frames))) => process_output(
+                    stream,
+                    &mut ctxt.transfer_buffer,
+                    status,
+                    delay_frames,
+                    data_callback,
+                ),
+                Ok(None) => {
+                    // Resuming from suspend. Nothing to wait on without poll().
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                Err(err) => Err(err),
+            }
+        } else {
+            match poll_for_period(&rx, stream, &mut ctxt) {
+                Ok(Poll::Pending) => continue,
+                Ok(Poll::Ready {
+                    status,
+                    delay_frames,
+                }) => process_output(
+                    stream,
+                    &mut ctxt.transfer_buffer,
+                    status,
+                    delay_frames,
+                    data_callback,
+                ),
+                Err(err) => Err(err),
+            }
         };
         if let Err(err) = result {
+            // Drop stops a blocking PCM under the worker (EBADFD from writei);
+            // that is the shutdown, not an error to report.
+            if stream.blocking_writes && stream.dropping.load(Ordering::Acquire) {
+                return;
+            }
             match err.kind() {
                 ErrorKind::Xrun => {
                     error_callback(err);
@@ -1206,6 +1282,30 @@ fn process_input(
     Ok(())
 }
 
+// Device status for a render that is not preceded by poll() (blocking feed).
+// `None` while a suspend is still resuming. The rendered period is appended
+// after everything queued now, so `now + delay` is its playback time however
+// long the blocking write then takes.
+fn output_status(stream: &StreamInner) -> Result<Option<(alsa::pcm::Status, usize)>, Error> {
+    let delay_frames = match stream.handle.avail_delay() {
+        Err(err) if err.errno() == libc::EPIPE => return Err(ErrorKind::Xrun.into()),
+        Err(err) if err.errno() == libc::ESTRPIPE => {
+            return try_resume(&stream.handle).map(|_| None);
+        }
+        res => res?.1,
+    };
+    let audio_ts_type = match stream.timestamp_mode {
+        TimestampMode::AudioLink => alsa::pcm::AudioTstampType::LinkSynchronized,
+        TimestampMode::SystemClock | TimestampMode::CreationInstant => {
+            alsa::pcm::AudioTstampType::Compat
+        }
+    };
+    let status = alsa::pcm::StatusBuilder::new()
+        .audio_htstamp_config(audio_ts_type, false)
+        .build(&stream.handle)?;
+    Ok(Some((status, delay_frames.max(0) as usize)))
+}
+
 // Request data from the user's function and write it via ALSA.
 fn process_output(
     stream: &StreamInner,
@@ -1383,6 +1483,12 @@ impl Drop for Stream {
         self.signal_ready();
         self.inner.dropping.store(true, Ordering::Release);
         self.trigger.wakeup();
+        if self.inner.blocking_writes {
+            // The worker may sit in a blocking writei that no self-pipe can
+            // reach, indefinitely if the stream is paused with a full ring.
+            // snd_pcm_drop() stops the PCM and returns that call at once.
+            let _ = self.inner.handle.drop();
+        }
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }
